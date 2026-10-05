@@ -1,5 +1,108 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
 
+macro_rules! println {
+    () => {{
+        crate::last_log::write_line(false, String::new());
+    }};
+    ($($arg:tt)*) => {{
+        crate::last_log::write_line(false, format!($($arg)*));
+    }};
+}
+
+macro_rules! eprintln {
+    () => {{
+        crate::last_log::write_line(true, String::new());
+    }};
+    ($($arg:tt)*) => {{
+        crate::last_log::write_line(true, format!($($arg)*));
+    }};
+}
+
+mod last_log {
+    use std::{
+        env,
+        fs::{self, File, OpenOptions},
+        io::{self, Write},
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+    pub fn init() -> io::Result<PathBuf> {
+        let base = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join("DiscordOnlyDPI");
+        fs::create_dir_all(&base)?;
+
+        let path = base.join("last-run.log");
+
+        // DiscordOnlyDPI owns this directory's diagnostic logs. Keep exactly one.
+        if let Ok(entries) = fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let old = entry.path();
+                if old != path
+                    && old.is_file()
+                    && old.extension().and_then(|v| v.to_str()) == Some("log")
+                {
+                    let _ = fs::remove_file(old);
+                }
+            }
+        }
+
+        // Truncate the previous run, then reopen in append mode so child processes
+        // can safely append to the same single file.
+        File::create(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let slot = LOG_FILE.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(file);
+        }
+
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        write_line(false, "=== DiscordOnlyDPI last run ===".to_string());
+        write_line(false, format!("Started (unix): {started}"));
+        Ok(path)
+    }
+
+    pub fn write_line(is_error: bool, message: String) {
+        if is_error {
+            std::eprintln!("{message}");
+        } else {
+            std::println!("{message}");
+        }
+
+        if let Some(slot) = LOG_FILE.get() {
+            if let Ok(mut guard) = slot.lock() {
+                if let Some(file) = guard.as_mut() {
+                    if is_error {
+                        let _ = writeln!(file, "[ERROR] {message}");
+                    } else {
+                        let _ = writeln!(file, "{message}");
+                    }
+                    let _ = file.flush();
+                }
+            }
+        }
+    }
+
+    pub fn open_append_file() -> io::Result<File> {
+        let base = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join("DiscordOnlyDPI");
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(base.join("last-run.log"))
+    }
+}
+
 use reqwest::{header, Client, Proxy};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -56,20 +159,37 @@ struct ProxyState {
 async fn main() -> Result<(), AnyError> {
     #[cfg(not(target_os = "windows"))]
     {
-        println!("DiscordOnlyDPI v0.8 currently targets Windows 10/11.");
+        println!(
+            "DiscordOnlyDPI v{} currently targets Windows 10/11.",
+            env!("CARGO_PKG_VERSION")
+        );
         return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        run_windows().await
+        let log_path = last_log::init()?;
+        std::panic::set_hook(Box::new(|info| {
+            crate::last_log::write_line(true, format!("PANIC: {info}"));
+        }));
+        println!("Log file: {}", log_path.display());
+
+        match run_windows().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("Fatal error: {error}");
+                Err(error)
+            }
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 async fn run_windows() -> Result<(), AnyError> {
-    println!("DiscordOnlyDPI v0.8");
+    println!("DiscordOnlyDPI v{}", env!("CARGO_PKG_VERSION"));
     println!("Mode: Discord-only / no system proxy / no WinDivert");
+    tray::start();
+    println!("Minimize-to-tray enabled: minimize the console to hide it from the taskbar");
 
     let engine = ensure_byedpi().await?;
     let mut byedpi = spawn_byedpi(&engine)?;
@@ -85,24 +205,33 @@ async fn run_windows() -> Result<(), AnyError> {
     wait_for_port(FRONTEND_PORT, Duration::from_secs(3)).await?;
     wait_for_port(UPDATER_HTTP_PORT, Duration::from_secs(3)).await?;
 
-    let (discord_exe, process_name) = find_discord_exe()?;
+    let (installed_exe, process_name) = find_discord_exe()?;
     stop_existing_discord(&process_name);
-    sync_discord_modules(&discord_exe, &process_name).await?;
 
-    // The HTTP CONNECT proxy is only needed by our module synchronizer.
-    // Stop it before Discord starts so no unrelated process can use it.
+    let manifest = fetch_discord_manifest(&process_name).await?;
+    let discord_exe = ensure_latest_discord_host(&installed_exe, &process_name, &manifest).await?;
+    sync_discord_modules(&discord_exe, &process_name, &manifest).await?;
+
+    // The HTTP CONNECT proxy is only needed while DiscordOnlyDPI updates Discord.
+    // Stop it before Discord starts so games and unrelated processes cannot use it.
     updater_proxy_task.abort();
 
     prepare_discord_startup(&discord_exe, &process_name)?;
 
-    println!("Strict isolation: updater proxy stopped; Discord-only SOCKS remains");
+    println!("Auto-update complete; updater proxy stopped before Discord launch");
+    println!("Strict isolation: Discord-only SOCKS remains");
     println!("Launching: {}", discord_exe.display());
     let voice_tcp = env::args().any(|a| a == "--voice-tcp");
     let mut discord = launch_discord(&discord_exe, voice_tcp)?;
 
-    let _ = tokio::task::spawn_blocking(move || discord.wait()).await;
+    match tokio::task::spawn_blocking(move || discord.wait()).await {
+        Ok(Ok(status)) => println!("Discord exited with status: {status}"),
+        Ok(Err(error)) => eprintln!("Failed while waiting for Discord: {error}"),
+        Err(error) => eprintln!("Discord wait task failed: {error}"),
+    }
     socks_task.abort();
     let _ = byedpi.kill();
+    println!("DiscordOnlyDPI shutdown complete");
 
     Ok(())
 }
@@ -175,6 +304,9 @@ fn sha256_file(path: &Path) -> Result<String, AnyError> {
 
 #[cfg(target_os = "windows")]
 fn spawn_byedpi(exe: &Path) -> Result<Child, AnyError> {
+    let log_stdout = last_log::open_append_file()?;
+    let log_stderr = log_stdout.try_clone()?;
+
     let mut cmd = Command::new(exe);
     cmd.arg("-i")
         .arg("127.0.0.1")
@@ -182,8 +314,8 @@ fn spawn_byedpi(exe: &Path) -> Result<Child, AnyError> {
         .arg(BYEDPI_PORT.to_string())
         .args(BYEDPI_ARGS)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(log_stdout))
+        .stderr(Stdio::from(log_stderr));
 
     hide_window(&mut cmd);
     Ok(cmd.spawn()?)
@@ -605,8 +737,172 @@ fn find_discord_exe() -> Result<(PathBuf, String), AnyError> {
     Err("Discord installation was not found under LOCALAPPDATA".into())
 }
 
+fn discord_channel(process_name: &str) -> &'static str {
+    match process_name.to_ascii_lowercase().as_str() {
+        "discordptb.exe" => "ptb",
+        "discordcanary.exe" => "canary",
+        _ => "stable",
+    }
+}
+
+fn discord_update_client() -> Result<Client, AnyError> {
+    let proxy_url = format!("http://127.0.0.1:{UPDATER_HTTP_PORT}");
+    Ok(Client::builder()
+        .proxy(Proxy::all(&proxy_url)?)
+        .timeout(Duration::from_secs(180))
+        .build()?)
+}
+
+async fn fetch_discord_manifest(process_name: &str) -> Result<Value, AnyError> {
+    let channel = discord_channel(process_name);
+    let client = discord_update_client()?;
+
+    println!("Checking latest Discord {channel} version through ByeDPI...");
+
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match client
+            .get("https://updates.discord.com/distributions/app/manifests/latest")
+            .header(header::USER_AGENT, "Discord-Updater/1")
+            .query(&[("channel", channel), ("platform", "win"), ("arch", "x64")])
+            .send()
+            .await
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => return Ok(response.json::<Value>().await?),
+                Err(e) => last_error = Some(e.to_string()),
+            },
+            Err(e) => last_error = Some(e.to_string()),
+        }
+
+        eprintln!("Manifest check attempt {attempt}/3 failed");
+        sleep(Duration::from_millis(500 * attempt)).await;
+    }
+
+    Err(format!(
+        "Unable to fetch Discord update manifest: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
+}
+
 #[cfg(target_os = "windows")]
-async fn sync_discord_modules(exe: &Path, process_name: &str) -> Result<(), AnyError> {
+async fn ensure_latest_discord_host(
+    installed_exe: &Path,
+    process_name: &str,
+    manifest: &Value,
+) -> Result<PathBuf, AnyError> {
+    let current_dir = installed_exe
+        .parent()
+        .ok_or("Discord executable has no parent directory")?;
+    let install_root = current_dir
+        .parent()
+        .ok_or("Discord app directory has no install root")?;
+
+    let current_folder = current_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Unable to determine installed Discord version")?;
+    let current_version = current_folder
+        .strip_prefix("app-")
+        .ok_or("Unexpected Discord app folder name")?;
+
+    let latest_version = json_version(
+        manifest
+            .get("full")
+            .and_then(|v| v.get("host_version"))
+            .ok_or("Discord manifest is missing full.host_version")?,
+    )?;
+
+    let target_dir = install_root.join(format!("app-{latest_version}"));
+    let target_exe = target_dir.join(process_name);
+    let target_asar = target_dir.join("resources").join("app.asar");
+    let target_build_info = target_dir.join("resources").join("build_info.json");
+    let target_complete =
+        target_exe.is_file() && target_asar.is_file() && target_build_info.is_file();
+
+    if latest_version == current_version && target_complete {
+        println!("Discord host {latest_version}: already current");
+        return Ok(target_exe);
+    }
+
+    if target_complete {
+        println!("Discord host {latest_version}: already installed, switching to it");
+        return Ok(target_exe);
+    }
+
+    let full = manifest
+        .get("full")
+        .ok_or("Discord manifest is missing full package")?;
+    let url = full
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("Discord full package has no URL")?;
+    let expected_hash = full
+        .get("package_sha256")
+        .and_then(Value::as_str)
+        .ok_or("Discord full package has no package_sha256")?;
+
+    println!("Discord host update: {current_version} -> {latest_version}");
+    println!("Downloading official Discord host package...");
+
+    let client = discord_update_client()?;
+    let package = client
+        .get(url)
+        .header(header::USER_AGENT, "Discord-Updater/1")
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let actual_hash = sha256_bytes(&package);
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(format!(
+            "Discord host SHA-256 mismatch: expected {expected_hash}, got {actual_hash}"
+        )
+        .into());
+    }
+
+    let temp_dir = install_root.join(format!(
+        "app-{latest_version}.discordonlydpi-tmp-{}",
+        std::process::id()
+    ));
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+    }
+    fs::create_dir_all(&temp_dir)?;
+
+    if let Err(e) = extract_full_distro(&package, &temp_dir) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(e);
+    }
+
+    let temp_exe = temp_dir.join(process_name);
+    let temp_asar = temp_dir.join("resources").join("app.asar");
+    let temp_build_info = temp_dir.join("resources").join("build_info.json");
+
+    if !temp_exe.is_file() || !temp_asar.is_file() || !temp_build_info.is_file() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err("Downloaded Discord host package is incomplete".into());
+    }
+
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir)?;
+    }
+    fs::rename(&temp_dir, &target_dir)?;
+
+    println!("Discord host {latest_version}: installed successfully");
+    Ok(target_exe)
+}
+
+#[cfg(target_os = "windows")]
+async fn sync_discord_modules(
+    exe: &Path,
+    process_name: &str,
+    manifest: &Value,
+) -> Result<(), AnyError> {
     let config_dir = match process_name.to_ascii_lowercase().as_str() {
         "discordptb.exe" => "discordptb",
         "discordcanary.exe" => "discordcanary",
@@ -628,23 +924,7 @@ async fn sync_discord_modules(exe: &Path, process_name: &str) -> Result<(), AnyE
         .ok_or("Unexpected Discord app folder name")?
         .to_string();
 
-    let proxy_url = format!("http://127.0.0.1:{UPDATER_HTTP_PORT}");
-    let client = Client::builder()
-        .proxy(Proxy::all(&proxy_url)?)
-        .timeout(Duration::from_secs(90))
-        .build()?;
-
-    println!("Fetching official Discord module manifest through ByeDPI...");
-
-    let manifest = client
-        .get("https://updates.discord.com/distributions/app/manifests/latest")
-        .header(header::USER_AGENT, "Discord-Updater/1")
-        .query(&[("channel", "stable"), ("platform", "win"), ("arch", "x64")])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let client = discord_update_client()?;
 
     let manifest_host = json_version(
         manifest
@@ -655,7 +935,7 @@ async fn sync_discord_modules(exe: &Path, process_name: &str) -> Result<(), AnyE
 
     if manifest_host != host_version {
         return Err(format!(
-            "Discord host version mismatch: installed {host_version}, manifest {manifest_host}.              This build will not mix modules from different Discord host versions."
+            "Internal update error: host {host_version} does not match manifest {manifest_host}"
         )
         .into());
     }
@@ -687,16 +967,24 @@ async fn sync_discord_modules(exe: &Path, process_name: &str) -> Result<(), AnyE
         .map(str::to_string)
         .collect::<Vec<_>>();
 
-    if manifest
+    let modules = manifest
         .get("modules")
-        .and_then(|m| m.get("discord_zstd"))
-        .is_some()
-        && !desired.iter().any(|m| m == "discord_zstd")
-    {
-        desired.push("discord_zstd".to_string());
-    }
+        .and_then(Value::as_object)
+        .ok_or("Discord manifest is missing modules")?;
 
-    println!("Required Discord modules: {}", desired.join(", "));
+    let mut optional = modules
+        .keys()
+        .filter(|name| !desired.iter().any(|required| required == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+    optional.sort();
+    desired.extend(optional);
+
+    println!(
+        "Discord modules to sync ({}): {}",
+        desired.len(),
+        desired.join(", ")
+    );
 
     for module_name in desired {
         let full = manifest
@@ -968,10 +1256,15 @@ fn launch_discord(exe: &Path, voice_tcp: bool) -> Result<Child, AnyError> {
     let parent = exe.parent().ok_or("Discord executable has no parent")?;
     let proxy = format!("socks5://127.0.0.1:{FRONTEND_PORT}");
 
+    let log_stdout = last_log::open_append_file()?;
+    let log_stderr = log_stdout.try_clone()?;
+
     let mut cmd = Command::new(exe);
     cmd.current_dir(parent)
         .arg(format!("--proxy-server={proxy}"))
-        .arg("--disable-quic");
+        .arg("--disable-quic")
+        .stdout(Stdio::from(log_stdout))
+        .stderr(Stdio::from(log_stderr));
 
     // Prevent Discord and its child processes from inheriting any ambient
     // proxy environment. Only Chromium's explicit --proxy-server is used.
@@ -1005,4 +1298,161 @@ fn hide_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(target_os = "windows")]
+mod tray {
+    use std::{
+        mem::{size_of, zeroed},
+        ptr::{null, null_mut},
+        sync::atomic::{AtomicIsize, Ordering},
+        thread,
+        time::Duration,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::{Console::GetConsoleWindow, LibraryLoader::GetModuleHandleW},
+        UI::{
+            Shell::{
+                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                NOTIFYICONDATAW,
+            },
+            WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic,
+                LoadIconW, PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow,
+                TranslateMessage, HICON, ICON_BIG, ICON_SMALL, MSG, SW_HIDE, SW_RESTORE, WM_APP,
+                WM_DESTROY, WM_LBUTTONUP, WM_SETICON, WNDCLASSW,
+            },
+        },
+    };
+
+    const WM_TRAY_ICON: u32 = WM_APP + 1;
+    static CONSOLE_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    pub fn start() {
+        let console = unsafe { GetConsoleWindow() };
+        if console.is_null() {
+            return;
+        }
+
+        CONSOLE_HWND.store(console as isize, Ordering::SeqCst);
+
+        unsafe {
+            let app_icon = load_app_icon();
+            if !app_icon.is_null() {
+                SendMessageW(console, WM_SETICON, ICON_BIG as usize, app_icon as isize);
+                SendMessageW(console, WM_SETICON, ICON_SMALL as usize, app_icon as isize);
+            }
+        }
+
+        thread::spawn(|| unsafe {
+            tray_message_loop();
+        });
+
+        thread::spawn(|| loop {
+            let raw = CONSOLE_HWND.load(Ordering::SeqCst);
+            if raw == 0 {
+                break;
+            }
+
+            let hwnd = raw as HWND;
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+
+            thread::sleep(Duration::from_millis(120));
+        });
+    }
+
+    unsafe fn load_app_icon() -> HICON {
+        let instance = GetModuleHandleW(null());
+        LoadIconW(instance, 1usize as *const u16)
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_TRAY_ICON && lparam as u32 == WM_LBUTTONUP {
+            let raw = CONSOLE_HWND.load(Ordering::SeqCst);
+            if raw != 0 {
+                ShowWindow(raw as HWND, SW_RESTORE);
+            }
+            return 0;
+        }
+
+        if msg == WM_DESTROY {
+            PostQuitMessage(0);
+            return 0;
+        }
+
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    unsafe fn tray_message_loop() {
+        let instance = GetModuleHandleW(null());
+        let class_name = wide("DiscordOnlyDPITrayWindow");
+
+        let mut class: WNDCLASSW = zeroed();
+        class.lpfnWndProc = Some(window_proc);
+        class.hInstance = instance;
+        class.hIcon = load_app_icon();
+        class.lpszClassName = class_name.as_ptr();
+
+        if RegisterClassW(&class) == 0 {
+            return;
+        }
+
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            instance,
+            null_mut(),
+        );
+
+        if hwnd.is_null() {
+            return;
+        }
+
+        let mut icon: NOTIFYICONDATAW = zeroed();
+        icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = hwnd;
+        icon.uID = 1;
+        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        icon.uCallbackMessage = WM_TRAY_ICON;
+        icon.hIcon = load_app_icon();
+
+        let tooltip = wide("DiscordOnlyDPI - click to restore");
+        let copy_len = tooltip.len().saturating_sub(1).min(icon.szTip.len() - 1);
+        icon.szTip[..copy_len].copy_from_slice(&tooltip[..copy_len]);
+
+        if Shell_NotifyIconW(NIM_ADD, &icon) == 0 {
+            return;
+        }
+
+        let mut message: MSG = zeroed();
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
 }
