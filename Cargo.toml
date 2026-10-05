@@ -2,6 +2,10 @@
 name = "discord-only-dpi"
 version = "0.9.3"
 edition = "2021"
+description = "Discord-only DPI bypass utility for Windows"
+repository = "https://github.com/rouny-alsayad/DiscordOnlyDPI"
+readme = "README.md"
+keywords = ["discord", "dpi", "windows", "proxy", "rust"]
 
 [dependencies]
 brotli = "8"

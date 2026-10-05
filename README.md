@@ -1,14 +1,30 @@
+<div align="center">
+
+<img src="assets/DiscordOnlyDPI.png" width="170" alt="DiscordOnlyDPI logo">
+
 # DiscordOnlyDPI
 
 **Discord-only DPI bypass for Windows, written in Rust.**
 
+<p>
+  <a href="https://github.com/rouny-alsayad/DiscordOnlyDPI/releases/latest"><img src="https://img.shields.io/github/v/release/rouny-alsayad/DiscordOnlyDPI?style=for-the-badge&label=Latest%20Release" alt="Latest Release"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10/11">
+  <img src="https://img.shields.io/badge/Rust-Native-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
+  <a href="https://github.com/rouny-alsayad/DiscordOnlyDPI/releases"><img src="https://img.shields.io/github/downloads/rouny-alsayad/DiscordOnlyDPI/total?style=for-the-badge&label=Downloads" alt="Downloads"></a>
+</p>
+
+### [⬇ Download Latest Release](https://github.com/rouny-alsayad/DiscordOnlyDPI/releases/latest)
+
+**Current version: `v0.9.3`**
+
+[English](#english) • [العربية](#العربية)
+
+</div>
+
 DiscordOnlyDPI routes only Discord through a local ByeDPI-based proxy while leaving games, browsers, launchers, and the rest of Windows on the normal network path.
 
-> This project is **not a system-wide VPN**. It does not enable a Windows proxy, change the default route, install WinDivert, or install a kernel network driver.
-
-**Current version:** `v0.9.3`
-
-[العربية](#العربية) • [English](#english)
+> [!IMPORTANT]
+> DiscordOnlyDPI is **not a system-wide VPN**. It does not enable the Windows system proxy, change the default route, install WinDivert, or install a kernel network driver.
 
 ---
 
