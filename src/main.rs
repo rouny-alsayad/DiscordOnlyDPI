@@ -147,6 +147,10 @@ const BYEDPI_ARGS: &[&str] = &[
     "--tlsrec",
     "1+s",
 ];
+const RELEASES_API: &str =
+    "https://api.github.com/repos/rouny-alsayad/DiscordOnlyDPI/releases/latest";
+// Set for a process started by a self-update; it holds the previous version.
+const UPDATED_FROM_ENV: &str = "DISCORDONLYDPI_UPDATED_FROM";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 // A Discord that exits this soon without ever loading its UI failed to start.
 const STARTUP_GRACE: Duration = Duration::from_secs(60);
@@ -199,6 +203,13 @@ async fn main() -> Result<(), AnyError> {
 #[cfg(target_os = "windows")]
 async fn run_windows() -> Result<(), AnyError> {
     println!("DiscordOnlyDPI v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(previous) = env::var_os(UPDATED_FROM_ENV) {
+        println!(
+            "DiscordOnlyDPI was updated automatically from v{}",
+            previous.to_string_lossy()
+        );
+    }
+    remove_replaced_exe();
     println!("Mode: Discord-only / no system proxy / no WinDivert");
     tray::start();
     println!("Minimize-to-tray enabled: minimize the console to hide it from the taskbar");
@@ -211,6 +222,15 @@ async fn run_windows() -> Result<(), AnyError> {
         http: Client::builder().timeout(Duration::from_secs(8)).build()?,
         dns: Arc::new(DnsCache::default()),
     };
+
+    if let Some(updated_exe) = update_self(&state).await {
+        // The new version starts its own ByeDPI on the same port.
+        let _ = byedpi.kill();
+        let _ = byedpi.wait();
+        tray::stop();
+        relaunch_self(&updated_exe)?;
+        return Ok(());
+    }
 
     let socks_task = tokio::spawn(run_frontend(state.clone()));
     wait_for_port(FRONTEND_PORT, Duration::from_secs(3)).await?;
@@ -268,8 +288,227 @@ async fn run_windows() -> Result<(), AnyError> {
 
     socks_task.abort();
     let _ = byedpi.kill();
+    tray::stop();
     println!("DiscordOnlyDPI shutdown complete");
 
+    Ok(())
+}
+
+/// A newer GitHub release of DiscordOnlyDPI that can be installed.
+#[derive(Debug, PartialEq)]
+struct SelfUpdate {
+    version: String,
+    exe_name: String,
+    exe_url: String,
+    sums_url: String,
+}
+
+/// Parses "v1.2.3" or "1.2.3".
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = text.trim().trim_start_matches('v').split('.');
+    let version = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
+/// Picks the update from GitHub's latest-release JSON. Ok(None) means up to date;
+/// Err explains why a newer release cannot be installed.
+fn find_self_update(release: &Value, current: &str) -> Result<Option<SelfUpdate>, String> {
+    let tag = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .ok_or("GitHub release has no tag_name")?;
+    let latest = parse_version(tag).ok_or_else(|| format!("Unexpected release tag {tag}"))?;
+    let current = parse_version(current).ok_or("Unexpected DiscordOnlyDPI version")?;
+
+    let flagged = |key: &str| release.get(key).and_then(Value::as_bool) == Some(true);
+    if latest <= current || flagged("draft") || flagged("prerelease") {
+        return Ok(None);
+    }
+
+    let version = format!("{}.{}.{}", latest.0, latest.1, latest.2);
+    let exe_name = format!("DiscordOnlyDPI-v{version}-windows-x64.exe");
+    let assets = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or("GitHub release has no assets")?;
+    let asset_url = |name: &str| {
+        assets
+            .iter()
+            .find(|asset| asset.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|asset| asset.get("browser_download_url"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("Release {tag} has no {name} asset"))
+    };
+
+    Ok(Some(SelfUpdate {
+        exe_url: asset_url(&exe_name)?,
+        sums_url: asset_url("SHA256SUMS.txt")?,
+        exe_name,
+        version,
+    }))
+}
+
+/// Finds `file_name` in a `sha256sum` style file.
+fn checksum_for(sums: &str, file_name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        (name == file_name && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+/// Installs a newer DiscordOnlyDPI from GitHub Releases. Returns the path to
+/// start when the running exe was replaced. Any failure keeps the current version.
+#[cfg(target_os = "windows")]
+async fn update_self(state: &ProxyState) -> Option<PathBuf> {
+    if env::var_os(UPDATED_FROM_ENV).is_some() || env::args().any(|a| a == "--no-self-update") {
+        return None;
+    }
+
+    let current = env!("CARGO_PKG_VERSION");
+    let result = match UpdaterProxy::start(state).await {
+        Ok(proxy) => {
+            let result = install_self_update(current).await;
+            proxy.stop().await;
+            result
+        }
+        Err(error) => Err(error),
+    };
+
+    match result {
+        Ok(updated) => updated,
+        Err(error) => {
+            eprintln!("DiscordOnlyDPI self-update failed, continuing with v{current}: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn install_self_update(current: &str) -> Result<Option<PathBuf>, AnyError> {
+    println!("Checking for a new DiscordOnlyDPI version...");
+    let client = discord_update_client()?;
+    let user_agent = format!("DiscordOnlyDPI/{current}");
+
+    let release = client
+        .get(RELEASES_API)
+        .header(header::USER_AGENT, &user_agent)
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+
+    let Some(update) = find_self_update(&release, current)? else {
+        println!("DiscordOnlyDPI v{current} is up to date");
+        return Ok(None);
+    };
+
+    println!(
+        "DiscordOnlyDPI update: v{current} -> v{}. Downloading...",
+        update.version
+    );
+
+    let sums = client
+        .get(&update.sums_url)
+        .header(header::USER_AGENT, &user_agent)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let expected = checksum_for(&sums, &update.exe_name)
+        .ok_or_else(|| format!("SHA256SUMS.txt has no entry for {}", update.exe_name))?;
+
+    let exe = client
+        .get(&update.exe_url)
+        .header(header::USER_AGENT, &user_agent)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let actual = sha256_bytes(&exe);
+    if actual != expected {
+        return Err(format!(
+            "SHA-256 mismatch for {}: expected {expected}, got {actual}",
+            update.exe_name
+        )
+        .into());
+    }
+    if !exe.starts_with(b"MZ") {
+        return Err(format!("{} is not a Windows executable", update.exe_name).into());
+    }
+
+    let path = replace_current_exe(&exe)?;
+    println!(
+        "DiscordOnlyDPI v{} installed; restarting...",
+        update.version
+    );
+    Ok(Some(path))
+}
+
+/// Windows lets a running exe be renamed but not overwritten, so the running
+/// exe is moved to `<name>.exe.old` and the new one takes its place.
+#[cfg(target_os = "windows")]
+fn replace_current_exe(bytes: &[u8]) -> Result<PathBuf, AnyError> {
+    let current = env::current_exe()?;
+    let staged = current.with_extension("exe.new");
+    let old = current.with_extension("exe.old");
+
+    fs::write(&staged, bytes)?;
+    let _ = fs::remove_file(&old);
+
+    if let Err(error) = fs::rename(&current, &old) {
+        let _ = fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&staged, &current) {
+        let _ = fs::rename(&old, &current);
+        let _ = fs::remove_file(&staged);
+        return Err(error.into());
+    }
+
+    Ok(current)
+}
+
+/// Deletes the exe left behind by the last self-update once the old process has exited.
+#[cfg(target_os = "windows")]
+fn remove_replaced_exe() {
+    let Ok(current) = env::current_exe() else {
+        return;
+    };
+    let old = current.with_extension("exe.old");
+    if !old.exists() {
+        return;
+    }
+
+    thread::spawn(move || {
+        for _ in 0..20 {
+            if fs::remove_file(&old).is_ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn relaunch_self(exe: &Path) -> Result<(), AnyError> {
+    // The new process shares this console and must not try to update again.
+    Command::new(exe)
+        .args(env::args_os().skip(1))
+        .env(UPDATED_FROM_ENV, env!("CARGO_PKG_VERSION"))
+        .spawn()?;
     Ok(())
 }
 
@@ -1823,6 +2062,17 @@ mod tray {
         true
     }
 
+    /// Removes the tray icon so it does not linger after DiscordOnlyDPI exits.
+    pub fn stop() {
+        CONSOLE_HWND.store(0, Ordering::SeqCst);
+        unsafe {
+            if let Some(icon) = tray_icon() {
+                Shell_NotifyIconW(NIM_DELETE, &icon);
+            }
+        }
+        TRAY_HWND.store(0, Ordering::SeqCst);
+    }
+
     unsafe fn tray_icon() -> Option<NOTIFYICONDATAW> {
         let raw = TRAY_HWND.load(Ordering::SeqCst);
         if raw == 0 {
@@ -2002,6 +2252,88 @@ mod tests {
         signals.observe("fatal: Error: Cannot find module 'discord_desktop_core'");
         assert!(signals.failed.load(Ordering::SeqCst));
         assert!(!signals.started.load(Ordering::SeqCst));
+    }
+
+    fn release(tag: &str, assets: &[&str]) -> Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": false,
+            "assets": assets
+                .iter()
+                .map(|name| serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://example.invalid/{name}"),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn parses_release_versions() {
+        assert_eq!(parse_version("v0.9.10"), Some((0, 9, 10)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2"), None);
+        assert_eq!(parse_version("v1.2.3.4"), None);
+        assert_eq!(parse_version("v1.2.x"), None);
+    }
+
+    #[test]
+    fn finds_newer_release_with_checksums() {
+        let update = find_self_update(
+            &release(
+                "v0.9.10",
+                &["DiscordOnlyDPI-v0.9.10-windows-x64.exe", "SHA256SUMS.txt"],
+            ),
+            "0.9.5",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(update.version, "0.9.10");
+        assert_eq!(update.exe_name, "DiscordOnlyDPI-v0.9.10-windows-x64.exe");
+        assert!(update.sums_url.ends_with("/SHA256SUMS.txt"));
+    }
+
+    #[test]
+    fn skips_same_older_draft_and_prerelease() {
+        let assets = ["DiscordOnlyDPI-v0.9.5-windows-x64.exe", "SHA256SUMS.txt"];
+        assert_eq!(
+            find_self_update(&release("v0.9.5", &assets), "0.9.5"),
+            Ok(None)
+        );
+        assert_eq!(
+            find_self_update(&release("v0.9.5", &assets), "0.10.0"),
+            Ok(None)
+        );
+
+        let mut draft = release("v0.9.6", &assets);
+        draft["draft"] = Value::Bool(true);
+        assert_eq!(find_self_update(&draft, "0.9.5"), Ok(None));
+
+        let mut pre = release("v0.9.6", &assets);
+        pre["prerelease"] = Value::Bool(true);
+        assert_eq!(find_self_update(&pre, "0.9.5"), Ok(None));
+    }
+
+    #[test]
+    fn refuses_release_without_checksums() {
+        let result = find_self_update(
+            &release("v0.9.6", &["DiscordOnlyDPI-v0.9.6-windows-x64.exe"]),
+            "0.9.5",
+        );
+        assert!(result.unwrap_err().contains("SHA256SUMS.txt"));
+    }
+
+    #[test]
+    fn reads_checksum_file() {
+        let hash = "AECD7E435FEBCFD29416FE3A8F6DFD6BF6CAFBE755D84735925ED6E0414042E0";
+        let sums = format!("{hash}  DiscordOnlyDPI-v0.9.5-windows-x64.exe\nzz  other.exe\n");
+        assert_eq!(
+            checksum_for(&sums, "DiscordOnlyDPI-v0.9.5-windows-x64.exe"),
+            Some(hash.to_ascii_lowercase())
+        );
+        assert_eq!(checksum_for(&sums, "other.exe"), None);
+        assert_eq!(checksum_for(&sums, "missing.exe"), None);
     }
 
     #[test]

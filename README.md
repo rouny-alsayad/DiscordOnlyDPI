@@ -113,6 +113,19 @@ Discord is never restarted without your click, so calls and games are not interr
 
 DiscordOnlyDPI remembers the last Discord version that started correctly. If a new Discord version fails to start (for example `Cannot find module 'discord_desktop_core'`), DiscordOnlyDPI closes it, switches back to the last working version, and starts Discord again. That version is skipped until Discord releases a newer one. The reason is written to `last-run.log`.
 
+## Automatic DiscordOnlyDPI updates
+
+DiscordOnlyDPI also updates itself. On every start it checks the latest release of this repository on GitHub. When a newer version is published, it:
+
+1. downloads `DiscordOnlyDPI-v<version>-windows-x64.exe` and `SHA256SUMS.txt` from that release;
+2. checks the exe against its SHA-256 in `SHA256SUMS.txt`;
+3. replaces its own exe in the same folder (same file name, so shortcuts keep working);
+4. restarts itself in the same window, before Discord is launched.
+
+If anything fails (no internet, missing checksum, read-only folder), the current version keeps running. Use `--no-self-update` to turn this off.
+
+Note: the file name keeps the version you first downloaded; `last-run.log` always shows the real version.
+
 ## Minimize to Tray
 
 Press the normal **Minimize** button on the DiscordOnlyDPI console window.
@@ -210,6 +223,15 @@ dist/DiscordOnlyDPI-v<version>-windows-x64.exe
 
 Do not commit build output such as `target/` or `dist/` to the repository. GitHub Releases is the better place for compiled `.exe` files.
 
+### Publishing a release
+
+```bash
+bash publish-release.sh
+```
+
+Bump `version` in `Cargo.toml` and write `release-notes/v<version>.md` first, then commit. The script builds the exe, tags `v<version>`, pushes, and creates the GitHub release with the exe **and** `SHA256SUMS.txt`. Installed copies only update from releases that include `SHA256SUMS.txt`.
+
+
 ## Project structure
 
 ```text
@@ -220,6 +242,7 @@ DiscordOnlyDPI/
 │   └── main.rs
 ├── build.rs
 ├── build-windows.sh
+├── publish-release.sh
 ├── tools/
 │   └── rc.exe
 ├── Cargo.toml
@@ -338,6 +361,19 @@ DiscordOnlyDPI يدير تحديث Discord بنفسه لأن Discord updater ا�
 
 البرنامج يتذكر آخر نسخة Discord اشتغلت صح. إذا نسخة جديدة فشلت بالتشغيل (مثل خطأ `Cannot find module 'discord_desktop_core'`)، البرنامج يسكّرها، يرجع لآخر نسخة كانت شغالة، ويشغّل Discord من جديد. النسخة اللي فشلت يتم تجاهلها لحد ما ينزل إصدار أحدث منها، والسبب ينكتب بـ`last-run.log`.
 
+## التحديث التلقائي لـDiscordOnlyDPI نفسه
+
+البرنامج صار يحدّث حاله كمان. عند كل تشغيل يفحص آخر Release للمشروع على GitHub. إذا في نسخة أحدث:
+
+1. ينزّل `DiscordOnlyDPI-v<version>-windows-x64.exe` و`SHA256SUMS.txt` من الـRelease.
+2. يتحقق من SHA-256 للـEXE حسب `SHA256SUMS.txt`.
+3. يبدّل ملف الـEXE تبعه بنفس المجلد وبنفس الاسم، فالاختصارات بتضل شغالة.
+4. يعيد تشغيل حاله بنفس النافذة، قبل ما يفتح Discord.
+
+إذا صار أي خطأ (ما في إنترنت، ما في checksum، المجلد ممنوع الكتابة فيه)، النسخة الحالية بتكمل شغل عادي. لإيقاف هالميزة استخدم `--no-self-update`.
+
+ملاحظة: اسم الملف بيضل بالإصدار اللي نزّلته أول مرة، و`last-run.log` دائمًا بيكتب الإصدار الحقيقي.
+
 ## Minimize to Tray
 
 اضغط زر **Minimize** العادي على نافذة DiscordOnlyDPI.
@@ -437,6 +473,15 @@ dist/DiscordOnlyDPI-v<version>-windows-x64.exe
 
 يفضل عدم رفع `target/` أو `dist/` إلى Git. استخدم GitHub Releases لنشر ملفات `.exe` الجاهزة.
 
+### نشر إصدار جديد
+
+```bash
+bash publish-release.sh
+```
+
+أول شي غيّر `version` بـ`Cargo.toml` واكتب `release-notes/v<version>.md` واعمل commit. السكربت بيبني الـEXE، بيعمل tag `v<version>`، بيرفع، وبينشئ Release على GitHub فيه الـEXE **و** `SHA256SUMS.txt`. النسخ المثبتة ما بتتحدث إلا من Release فيه `SHA256SUMS.txt`.
+
+
 ## بنية المشروع
 
 ```text
@@ -447,6 +492,7 @@ DiscordOnlyDPI/
 │   └── main.rs
 ├── build.rs
 ├── build-windows.sh
+├── publish-release.sh
 ├── tools/
 │   └── rc.exe
 ├── Cargo.toml
