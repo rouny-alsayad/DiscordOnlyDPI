@@ -210,13 +210,13 @@ async fn run_windows() -> Result<(), AnyError> {
 
     let manifest = fetch_discord_manifest(&process_name).await?;
     let discord_exe = ensure_latest_discord_host(&installed_exe, &process_name, &manifest).await?;
-    sync_discord_modules(&discord_exe, &process_name, &manifest).await?;
+    let modules_root = sync_discord_modules(&discord_exe, &process_name, &manifest).await?;
 
     // The HTTP CONNECT proxy is only needed while DiscordOnlyDPI updates Discord.
     // Stop it before Discord starts so games and unrelated processes cannot use it.
     updater_proxy_task.abort();
 
-    prepare_discord_startup(&discord_exe, &process_name)?;
+    prepare_discord_startup(&discord_exe, &process_name, &modules_root)?;
 
     println!("Auto-update complete; updater proxy stopped before Discord launch");
     println!("Strict isolation: Discord-only SOCKS remains");
@@ -902,7 +902,7 @@ async fn sync_discord_modules(
     exe: &Path,
     process_name: &str,
     manifest: &Value,
-) -> Result<(), AnyError> {
+) -> Result<PathBuf, AnyError> {
     let config_dir = match process_name.to_ascii_lowercase().as_str() {
         "discordptb.exe" => "discordptb",
         "discordcanary.exe" => "discordcanary",
@@ -1104,7 +1104,7 @@ async fn sync_discord_modules(
     }
 
     println!("Discord required modules are ready.");
-    Ok(())
+    Ok(modules_root)
 }
 
 fn json_version(value: &Value) -> Result<String, AnyError> {
@@ -1169,7 +1169,11 @@ fn extract_full_distro(bytes: &[u8], destination: &Path) -> Result<(), AnyError>
 }
 
 #[cfg(target_os = "windows")]
-fn prepare_discord_startup(exe: &Path, process_name: &str) -> Result<(), AnyError> {
+fn prepare_discord_startup(
+    exe: &Path,
+    process_name: &str,
+    modules_root: &Path,
+) -> Result<(), AnyError> {
     let config_dir = match process_name.to_ascii_lowercase().as_str() {
         "discordptb.exe" => "discordptb",
         "discordcanary.exe" => "discordcanary",
@@ -1183,7 +1187,10 @@ fn prepare_discord_startup(exe: &Path, process_name: &str) -> Result<(), AnyErro
 
     patch_json_flags(
         &settings,
-        &[("SKIP_HOST_UPDATE", true), ("SKIP_MODULE_UPDATE", true)],
+        &[
+            ("SKIP_HOST_UPDATE", Value::Bool(true)),
+            ("SKIP_MODULE_UPDATE", Value::Bool(true)),
+        ],
     )?;
 
     let resources = exe
@@ -1192,10 +1199,20 @@ fn prepare_discord_startup(exe: &Path, process_name: &str) -> Result<(), AnyErro
         .join("resources");
     let build_info = resources.join("build_info.json");
 
+    // Newer hosts dropped the legacy module updater. With the updater disabled,
+    // Discord only loads modules from build_info's localModulesRoot.
+    let modules_root = modules_root
+        .to_str()
+        .ok_or("Discord modules path is not valid UTF-8")?;
+
     if build_info.is_file() {
         patch_json_flags(
             &build_info,
-            &[("newUpdater", false), ("disableUpdater", true)],
+            &[
+                ("newUpdater", Value::Bool(false)),
+                ("disableUpdater", Value::Bool(true)),
+                ("localModulesRoot", Value::String(modules_root.to_string())),
+            ],
         )?;
     }
 
@@ -1204,7 +1221,7 @@ fn prepare_discord_startup(exe: &Path, process_name: &str) -> Result<(), AnyErro
 }
 
 #[cfg(target_os = "windows")]
-fn patch_json_flags(path: &Path, flags: &[(&str, bool)]) -> Result<(), AnyError> {
+fn patch_json_flags(path: &Path, flags: &[(&str, Value)]) -> Result<(), AnyError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1221,7 +1238,7 @@ fn patch_json_flags(path: &Path, flags: &[(&str, bool)]) -> Result<(), AnyError>
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
 
     for (key, value) in flags {
-        object.insert((*key).to_string(), Value::Bool(*value));
+        object.insert((*key).to_string(), value.clone());
     }
 
     if path.is_file() {
@@ -1369,7 +1386,8 @@ mod tray {
 
     unsafe fn load_app_icon() -> HICON {
         let instance = GetModuleHandleW(null());
-        LoadIconW(instance, 1usize as *const u16)
+        // MAKEINTRESOURCE(1): winres embeds the app icon as resource ID 1.
+        LoadIconW(instance, std::ptr::without_provenance(1))
     }
 
     unsafe extern "system" fn window_proc(

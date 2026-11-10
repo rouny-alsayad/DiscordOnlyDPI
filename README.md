@@ -15,7 +15,7 @@
 
 ### [⬇ Download Latest Release](https://github.com/rouny-alsayad/DiscordOnlyDPI/releases/latest)
 
-**Current version: `v0.9.3`**
+**Current version: `v0.9.4`**
 
 [English](#english) • [العربية](#العربية)
 
@@ -133,7 +133,7 @@ The log includes DiscordOnlyDPI messages and relevant child-process output, maki
 Download or build the Windows x64 executable and run:
 
 ```text
-DiscordOnlyDPI-v0.9.3-windows-x64.exe
+DiscordOnlyDPI-v0.9.4-windows-x64.exe
 ```
 
 Keep DiscordOnlyDPI running while using Discord. You can minimize it to the tray.
@@ -141,7 +141,7 @@ Keep DiscordOnlyDPI running while using Discord. You can minimize it to the tray
 ### Experimental Voice TCP mode
 
 ```text
-DiscordOnlyDPI-v0.9.3-windows-x64.exe --voice-tcp
+DiscordOnlyDPI-v0.9.4-windows-x64.exe --voice-tcp
 ```
 
 This adds WebRTC IP-handling switches intended to avoid non-proxied UDP during testing.
@@ -344,7 +344,7 @@ assets/DiscordOnlyDPI.ico
 شغّل:
 
 ```text
-DiscordOnlyDPI-v0.9.3-windows-x64.exe
+DiscordOnlyDPI-v0.9.4-windows-x64.exe
 ```
 
 اترك البرنامج شغالًا أثناء استخدام Discord. يمكنك تصغيره إلى الـTray.
@@ -352,7 +352,7 @@ DiscordOnlyDPI-v0.9.3-windows-x64.exe
 ### وضع Voice TCP التجريبي
 
 ```text
-DiscordOnlyDPI-v0.9.3-windows-x64.exe --voice-tcp
+DiscordOnlyDPI-v0.9.4-windows-x64.exe --voice-tcp
 ```
 
 هذا الوضع يضيف WebRTC IP-handling switches لمحاولة تجنب non-proxied UDP أثناء الاختبار.
