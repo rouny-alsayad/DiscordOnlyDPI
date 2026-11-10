@@ -15,7 +15,7 @@
 
 ### [⬇ Download Latest Release](https://github.com/rouny-alsayad/DiscordOnlyDPI/releases/latest)
 
-**Current version: `v0.9.4`**
+**Current version: `v0.9.5`**
 
 [English](#english) • [العربية](#العربية)
 
@@ -84,7 +84,7 @@ The program does **not** modify:
 - game processes;
 - anti-cheat processes.
 
-The temporary HTTP update proxy is used only while DiscordOnlyDPI itself checks/downloads Discord updates, then it is stopped before Discord is launched.
+The temporary HTTP update proxy is used only while DiscordOnlyDPI itself checks/downloads Discord updates, then it is stopped again: before Discord is launched, and after each background update check.
 
 Discord is also launched with inherited `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` environment variables removed, so only the explicit Discord SOCKS proxy is used.
 
@@ -99,6 +99,19 @@ On startup it checks the official Discord manifest. If the installed Host versio
 Existing compatible modules are reused. Packages are not mixed between different Discord Host versions.
 
 This means normal Discord Host and Module releases should not require a new DiscordOnlyDPI release **as long as Discord keeps the same distribution manifest/package format**.
+
+### Updates while Discord is open
+
+While Discord is running, DiscordOnlyDPI checks for a new Discord version every 30 minutes. A new Host is downloaded and installed next to the running one, without interrupting Discord. When it is ready, a Windows notification appears:
+
+- click the notification, or right-click the DiscordOnlyDPI tray icon, to restart Discord with the update now;
+- or do nothing, and the update is used the next time DiscordOnlyDPI starts.
+
+Discord is never restarted without your click, so calls and games are not interrupted.
+
+### Automatic rollback
+
+DiscordOnlyDPI remembers the last Discord version that started correctly. If a new Discord version fails to start (for example `Cannot find module 'discord_desktop_core'`), DiscordOnlyDPI closes it, switches back to the last working version, and starts Discord again. That version is skipped until Discord releases a newer one. The reason is written to `last-run.log`.
 
 ## Minimize to Tray
 
@@ -133,7 +146,7 @@ The log includes DiscordOnlyDPI messages and relevant child-process output, maki
 Download or build the Windows x64 executable and run:
 
 ```text
-DiscordOnlyDPI-v0.9.4-windows-x64.exe
+DiscordOnlyDPI-v0.9.5-windows-x64.exe
 ```
 
 Keep DiscordOnlyDPI running while using Discord. You can minimize it to the tray.
@@ -141,7 +154,7 @@ Keep DiscordOnlyDPI running while using Discord. You can minimize it to the tray
 ### Experimental Voice TCP mode
 
 ```text
-DiscordOnlyDPI-v0.9.4-windows-x64.exe --voice-tcp
+DiscordOnlyDPI-v0.9.5-windows-x64.exe --voice-tcp
 ```
 
 This adds WebRTC IP-handling switches intended to avoid non-proxied UDP during testing.
@@ -155,6 +168,7 @@ DiscordOnlyDPI uses:
 ```text
 %LOCALAPPDATA%\DiscordOnlyDPI\bin\ciadpi.exe
 %LOCALAPPDATA%\DiscordOnlyDPI\last-run.log
+%LOCALAPPDATA%\DiscordOnlyDPI\state.json
 ```
 
 The project does not need to read Discord tokens or account credentials.
@@ -295,7 +309,7 @@ DiscordOnlyDPI مصمم بحيث اتصال اللعبة لا يمر عبر بر
 - عمليات الألعاب.
 - عمليات Anti-Cheat.
 
-HTTP update proxy يعمل فقط أثناء فحص أو تنزيل تحديثات Discord ثم يتم إيقافه قبل تشغيل Discord.
+HTTP update proxy يعمل فقط أثناء فحص أو تنزيل تحديثات Discord ثم يتم إيقافه: قبل تشغيل Discord، وبعد كل فحص تحديث بالخلفية.
 
 كما أن البرنامج يزيل متغيرات `HTTP_PROXY` و`HTTPS_PROXY` و`ALL_PROXY` من بيئة عملية Discord، ويعتمد فقط على SOCKS المحدد صراحةً لـDiscord.
 
@@ -310,6 +324,19 @@ DiscordOnlyDPI يدير تحديث Discord بنفسه لأن Discord updater ا�
 الـModules الموجودة بنفس الإصدار يتم إعادة استخدامها، ولا يتم خلط Modules بين Host versions مختلفة.
 
 بالتالي تحديثات Discord الطبيعية لا يفترض أن تحتاج نسخة جديدة من DiscordOnlyDPI **طالما Discord لم يغيّر صيغة الـmanifest أو `full.distro` أو بنية التحديث بشكل جذري**.
+
+### التحديث وDiscord مفتوح
+
+أثناء تشغيل Discord، البرنامج يفحص كل 30 دقيقة إذا في إصدار جديد. الـHost الجديد يتنزّل ويتثبّت جنب النسخة الشغالة بدون ما يقطع Discord. لما يجهز، يطلع إشعار من ويندوز:
+
+- اضغط على الإشعار، أو كليك يمين على أيقونة DiscordOnlyDPI بالـTray، ليعيد تشغيل Discord بالتحديث فورًا.
+- أو اتركه، والتحديث بيشتغل بالمرة الجاية لما تفتح DiscordOnlyDPI.
+
+البرنامج ما بيعيد تشغيل Discord أبدًا بدون ضغطتك، فالمكالمات والألعاب ما بتنقطع.
+
+### الرجوع التلقائي للنسخة الشغالة
+
+البرنامج يتذكر آخر نسخة Discord اشتغلت صح. إذا نسخة جديدة فشلت بالتشغيل (مثل خطأ `Cannot find module 'discord_desktop_core'`)، البرنامج يسكّرها، يرجع لآخر نسخة كانت شغالة، ويشغّل Discord من جديد. النسخة اللي فشلت يتم تجاهلها لحد ما ينزل إصدار أحدث منها، والسبب ينكتب بـ`last-run.log`.
 
 ## Minimize to Tray
 
@@ -344,7 +371,7 @@ assets/DiscordOnlyDPI.ico
 شغّل:
 
 ```text
-DiscordOnlyDPI-v0.9.4-windows-x64.exe
+DiscordOnlyDPI-v0.9.5-windows-x64.exe
 ```
 
 اترك البرنامج شغالًا أثناء استخدام Discord. يمكنك تصغيره إلى الـTray.
@@ -352,7 +379,7 @@ DiscordOnlyDPI-v0.9.4-windows-x64.exe
 ### وضع Voice TCP التجريبي
 
 ```text
-DiscordOnlyDPI-v0.9.4-windows-x64.exe --voice-tcp
+DiscordOnlyDPI-v0.9.5-windows-x64.exe --voice-tcp
 ```
 
 هذا الوضع يضيف WebRTC IP-handling switches لمحاولة تجنب non-proxied UDP أثناء الاختبار.
@@ -366,6 +393,7 @@ DiscordOnlyDPI يستخدم:
 ```text
 %LOCALAPPDATA%\DiscordOnlyDPI\bin\ciadpi.exe
 %LOCALAPPDATA%\DiscordOnlyDPI\last-run.log
+%LOCALAPPDATA%\DiscordOnlyDPI\state.json
 ```
 
 المشروع لا يحتاج إلى قراءة Discord tokens أو بيانات تسجيل الدخول الخاصة بالحساب.

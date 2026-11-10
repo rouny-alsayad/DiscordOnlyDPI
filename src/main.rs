@@ -73,18 +73,19 @@ mod last_log {
     pub fn write_line(is_error: bool, message: String) {
         if is_error {
             std::eprintln!("{message}");
+            write_file_line(&format!("[ERROR] {message}"));
         } else {
             std::println!("{message}");
+            write_file_line(&message);
         }
+    }
 
+    /// Writes to the log file only; used for Discord's own output.
+    pub fn write_file_line(message: &str) {
         if let Some(slot) = LOG_FILE.get() {
             if let Ok(mut guard) = slot.lock() {
                 if let Some(file) = guard.as_mut() {
-                    if is_error {
-                        let _ = writeln!(file, "[ERROR] {message}");
-                    } else {
-                        let _ = writeln!(file, "{message}");
-                    }
+                    let _ = writeln!(file, "{message}");
                     let _ = file.flush();
                 }
             }
@@ -115,12 +116,17 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    task::JoinHandle,
     time::sleep,
 };
 use zip::ZipArchive;
@@ -141,6 +147,12 @@ const BYEDPI_ARGS: &[&str] = &[
     "--tlsrec",
     "1+s",
 ];
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+// A Discord that exits this soon without ever loading its UI failed to start.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+// A Discord that has run this long without a fatal error is treated as started,
+// even if its log format changes and the started marker is never seen.
+const STARTUP_ASSUME_OK: Duration = Duration::from_secs(120);
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -201,39 +213,425 @@ async fn run_windows() -> Result<(), AnyError> {
     };
 
     let socks_task = tokio::spawn(run_frontend(state.clone()));
-    let updater_proxy_task = tokio::spawn(run_http_connect_frontend(state));
     wait_for_port(FRONTEND_PORT, Duration::from_secs(3)).await?;
-    wait_for_port(UPDATER_HTTP_PORT, Duration::from_secs(3)).await?;
 
     let (installed_exe, process_name) = find_discord_exe()?;
     stop_existing_discord(&process_name);
 
-    let manifest = fetch_discord_manifest(&process_name).await?;
-    let discord_exe = ensure_latest_discord_host(&installed_exe, &process_name, &manifest).await?;
-    let modules_root = sync_discord_modules(&discord_exe, &process_name, &manifest).await?;
-
-    // The HTTP CONNECT proxy is only needed while DiscordOnlyDPI updates Discord.
-    // Stop it before Discord starts so games and unrelated processes cannot use it.
-    updater_proxy_task.abort();
-
-    prepare_discord_startup(&discord_exe, &process_name, &modules_root)?;
-
-    println!("Auto-update complete; updater proxy stopped before Discord launch");
-    println!("Strict isolation: Discord-only SOCKS remains");
-    println!("Launching: {}", discord_exe.display());
     let voice_tcp = env::args().any(|a| a == "--voice-tcp");
-    let mut discord = launch_discord(&discord_exe, voice_tcp)?;
+    let mut launch = LaunchState::load();
 
-    match tokio::task::spawn_blocking(move || discord.wait()).await {
-        Ok(Ok(status)) => println!("Discord exited with status: {status}"),
-        Ok(Err(error)) => eprintln!("Failed while waiting for Discord: {error}"),
-        Err(error) => eprintln!("Discord wait task failed: {error}"),
+    loop {
+        let prepared = prepare_discord(&state, &installed_exe, &process_name, &launch).await?;
+
+        println!("Auto-update complete; updater proxy stopped before Discord launch");
+        println!("Strict isolation: Discord-only SOCKS remains");
+
+        let outcome = run_discord(
+            &state,
+            &installed_exe,
+            &process_name,
+            &prepared,
+            voice_tcp,
+            &mut launch,
+        )
+        .await?;
+
+        match outcome {
+            DiscordOutcome::Exited => break,
+            DiscordOutcome::RestartForUpdate => {
+                println!("Restarting Discord to apply the update...");
+            }
+            DiscordOutcome::FailedToStart => {
+                let fallback = launch
+                    .last_good_host
+                    .clone()
+                    .filter(|good| *good != prepared.host && launch.last_good_manifest.is_some());
+
+                let Some(fallback) = fallback else {
+                    eprintln!(
+                        "Discord {} failed to start and there is no earlier working version to roll back to",
+                        prepared.host
+                    );
+                    break;
+                };
+
+                eprintln!(
+                    "Discord {} failed to start; rolling back to {fallback}",
+                    prepared.host
+                );
+                launch.bad_host = Some(prepared.host.clone());
+                launch.save();
+            }
+        }
     }
+
     socks_task.abort();
     let _ = byedpi.kill();
     println!("DiscordOnlyDPI shutdown complete");
 
     Ok(())
+}
+
+/// Remembers the last Discord host that started correctly, so a Discord update
+/// that breaks startup is rolled back instead of leaving Discord unusable.
+#[derive(Default)]
+struct LaunchState {
+    last_good_host: Option<String>,
+    last_good_manifest: Option<Value>,
+    bad_host: Option<String>,
+}
+
+impl LaunchState {
+    fn path() -> Option<PathBuf> {
+        env::var_os("LOCALAPPDATA").map(|base| {
+            PathBuf::from(base)
+                .join("DiscordOnlyDPI")
+                .join("state.json")
+        })
+    }
+
+    fn load() -> Self {
+        let Some(value) = Self::path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        else {
+            return Self::default();
+        };
+
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        Self {
+            last_good_host: text("last_good_host"),
+            last_good_manifest: value
+                .get("last_good_manifest")
+                .filter(|manifest| manifest.is_object())
+                .cloned(),
+            bad_host: text("bad_host"),
+        }
+    }
+
+    fn save(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+
+        let value = serde_json::json!({
+            "last_good_host": self.last_good_host,
+            "last_good_manifest": self.last_good_manifest,
+            "bad_host": self.bad_host,
+        });
+
+        let result = serde_json::to_vec_pretty(&value)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| fs::write(&path, bytes).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            eprintln!("Failed to save {}: {error}", path.display());
+        }
+    }
+}
+
+struct PreparedDiscord {
+    exe: PathBuf,
+    host: String,
+    manifest: Value,
+    modules_root: PathBuf,
+}
+
+enum DiscordOutcome {
+    Exited,
+    RestartForUpdate,
+    FailedToStart,
+}
+
+/// The HTTP CONNECT proxy is only needed while DiscordOnlyDPI updates Discord.
+/// It is stopped again right after, so games and unrelated processes cannot use it.
+struct UpdaterProxy(Option<JoinHandle<()>>);
+
+impl UpdaterProxy {
+    async fn start(state: &ProxyState) -> Result<Self, AnyError> {
+        let proxy = Self(Some(tokio::spawn(run_http_connect_frontend(state.clone()))));
+        if let Err(error) = wait_for_port(UPDATER_HTTP_PORT, Duration::from_secs(3)).await {
+            proxy.stop().await;
+            return Err(error);
+        }
+        Ok(proxy)
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for UpdaterProxy {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn prepare_discord(
+    state: &ProxyState,
+    installed_exe: &Path,
+    process_name: &str,
+    launch: &LaunchState,
+) -> Result<PreparedDiscord, AnyError> {
+    let proxy = UpdaterProxy::start(state).await?;
+    let result = install_discord(installed_exe, process_name, launch).await;
+    proxy.stop().await;
+
+    let prepared = result?;
+    prepare_discord_startup(&prepared.exe, process_name, &prepared.modules_root)?;
+    Ok(prepared)
+}
+
+#[cfg(target_os = "windows")]
+async fn install_discord(
+    installed_exe: &Path,
+    process_name: &str,
+    launch: &LaunchState,
+) -> Result<PreparedDiscord, AnyError> {
+    let latest = fetch_discord_manifest(process_name).await?;
+    let latest_host = manifest_host_version(&latest)?;
+
+    let manifest = match (&launch.bad_host, &launch.last_good_manifest) {
+        (Some(bad), Some(good)) if *bad == latest_host => {
+            println!(
+                "Discord host {latest_host} failed to start before; staying on the last working version until Discord releases a newer one"
+            );
+            good.clone()
+        }
+        _ => latest,
+    };
+
+    let exe = ensure_latest_discord_host(installed_exe, process_name, &manifest).await?;
+    let modules_root = sync_discord_modules(&exe, process_name, &manifest).await?;
+    let host = manifest_host_version(&manifest)?;
+
+    Ok(PreparedDiscord {
+        exe,
+        host,
+        manifest,
+        modules_root,
+    })
+}
+
+/// Startup markers read from Discord's console output.
+#[derive(Default)]
+struct StartupSignals {
+    started: AtomicBool,
+    failed: AtomicBool,
+}
+
+impl StartupSignals {
+    fn observe(&self, line: &str) {
+        // Discord's fatal handler prints "fatal: <error>" before showing its error dialog.
+        if line.starts_with("fatal: ") || line.contains("Cannot find module 'discord_") {
+            self.failed.store(true, Ordering::SeqCst);
+        } else if is_discord_app_log(line) || line.starts_with("Startup timing:") {
+            self.started.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Lines like "22:54:54.181 > ..." come from Discord's web app, which only runs
+/// once discord_desktop_core has loaded.
+fn is_discord_app_log(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() > 15
+        && bytes[..12].iter().enumerate().all(|(i, c)| match i {
+            2 | 5 => *c == b':',
+            8 => *c == b'.',
+            _ => c.is_ascii_digit(),
+        })
+        && &bytes[12..15] == b" > "
+}
+
+#[cfg(target_os = "windows")]
+async fn run_discord(
+    state: &ProxyState,
+    installed_exe: &Path,
+    process_name: &str,
+    prepared: &PreparedDiscord,
+    voice_tcp: bool,
+    launch: &mut LaunchState,
+) -> Result<DiscordOutcome, AnyError> {
+    println!("Launching: {}", prepared.exe.display());
+    let signals = Arc::new(StartupSignals::default());
+    let mut discord = launch_discord(&prepared.exe, voice_tcp, &signals)?;
+    let launched_at = Instant::now();
+
+    let mut exit = tokio::task::spawn_blocking(move || discord.wait());
+    let mut exited = false;
+    let mut updates: Option<JoinHandle<()>> = None;
+
+    let outcome = loop {
+        tokio::select! {
+            result = &mut exit => {
+                exited = true;
+                match result {
+                    Ok(Ok(status)) => println!("Discord exited with status: {status}"),
+                    Ok(Err(error)) => eprintln!("Failed while waiting for Discord: {error}"),
+                    Err(error) => eprintln!("Discord wait task failed: {error}"),
+                }
+
+                let started = signals.started.load(Ordering::SeqCst);
+                let failed = signals.failed.load(Ordering::SeqCst);
+                if !started && (failed || launched_at.elapsed() < STARTUP_GRACE) {
+                    break DiscordOutcome::FailedToStart;
+                }
+                break DiscordOutcome::Exited;
+            }
+            _ = sleep(Duration::from_millis(500)) => {
+                let failed = signals.failed.load(Ordering::SeqCst);
+                let started = signals.started.load(Ordering::SeqCst)
+                    || (!failed && launched_at.elapsed() >= STARTUP_ASSUME_OK);
+
+                if failed && !started {
+                    break DiscordOutcome::FailedToStart;
+                }
+
+                if started && updates.is_none() {
+                    println!("Discord {} started successfully", prepared.host);
+                    launch.last_good_host = Some(prepared.host.clone());
+                    launch.last_good_manifest = Some(prepared.manifest.clone());
+                    launch.save();
+
+                    updates = Some(tokio::spawn(watch_for_updates(
+                        state.clone(),
+                        installed_exe.to_path_buf(),
+                        process_name.to_string(),
+                        prepared.host.clone(),
+                        launch.bad_host.clone(),
+                    )));
+                }
+
+                if tray::take_restart_request() {
+                    break DiscordOutcome::RestartForUpdate;
+                }
+            }
+        }
+    };
+
+    if let Some(task) = updates {
+        task.abort();
+        let _ = task.await;
+    }
+
+    if !exited {
+        stop_existing_discord(process_name);
+        let _ = exit.await;
+    }
+
+    Ok(outcome)
+}
+
+/// Checks for Discord updates while Discord is running and prepares them in the
+/// background, then offers a restart from the tray.
+#[cfg(target_os = "windows")]
+async fn watch_for_updates(
+    state: ProxyState,
+    installed_exe: PathBuf,
+    process_name: String,
+    running_host: String,
+    bad_host: Option<String>,
+) {
+    loop {
+        sleep(UPDATE_CHECK_INTERVAL).await;
+
+        let proxy = match UpdaterProxy::start(&state).await {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                eprintln!("Background Discord update check failed: {error}");
+                continue;
+            }
+        };
+        let result = stage_discord_update(
+            &installed_exe,
+            &process_name,
+            &running_host,
+            bad_host.as_deref(),
+        )
+        .await;
+        proxy.stop().await;
+
+        match result {
+            Ok(Some(update)) => {
+                println!(
+                    "Discord update ready ({update}). Click the DiscordOnlyDPI notification or right-click the tray icon to restart Discord now; otherwise it is applied the next time DiscordOnlyDPI starts."
+                );
+                tray::announce_update(&update);
+                return;
+            }
+            Ok(None) => println!("Discord is up to date"),
+            Err(error) => eprintln!("Background Discord update check failed: {error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn stage_discord_update(
+    installed_exe: &Path,
+    process_name: &str,
+    running_host: &str,
+    bad_host: Option<&str>,
+) -> Result<Option<String>, AnyError> {
+    let manifest = fetch_discord_manifest(process_name).await?;
+    let latest = manifest_host_version(&manifest)?;
+
+    if bad_host == Some(latest.as_str()) {
+        return Ok(None);
+    }
+
+    if latest != running_host {
+        // A new host gets its own app-<version> folder and its own modules folder,
+        // so it can be installed while the current Discord keeps running.
+        let exe = ensure_latest_discord_host(installed_exe, process_name, &manifest).await?;
+        sync_discord_modules(&exe, process_name, &manifest).await?;
+        return Ok(Some(format!("Discord {latest}")));
+    }
+
+    // The running Discord has its modules loaded, so they are replaced on restart.
+    if modules_outdated(process_name, running_host, &manifest)? {
+        return Ok(Some(format!("Discord {latest} modules")));
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn modules_outdated(
+    process_name: &str,
+    host_version: &str,
+    manifest: &Value,
+) -> Result<bool, AnyError> {
+    let installed = fs::read_to_string(
+        discord_modules_root(process_name, host_version)?.join("installed.json"),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .unwrap_or(Value::Null);
+
+    let modules = manifest
+        .get("modules")
+        .and_then(Value::as_object)
+        .ok_or("Discord manifest is missing modules")?;
+
+    Ok(modules.iter().any(|(name, module)| {
+        let wanted = module
+            .get("full")
+            .and_then(|full| full.get("module_version"))
+            .and_then(Value::as_u64);
+        let installed_version = installed
+            .get(name)
+            .and_then(|v| v.get("installedVersion"))
+            .and_then(Value::as_u64);
+        wanted.is_some() && wanted != installed_version
+    }))
 }
 
 async fn ensure_byedpi() -> Result<PathBuf, AnyError> {
@@ -745,6 +1143,33 @@ fn discord_channel(process_name: &str) -> &'static str {
     }
 }
 
+fn discord_config_dir(process_name: &str) -> &'static str {
+    match process_name.to_ascii_lowercase().as_str() {
+        "discordptb.exe" => "discordptb",
+        "discordcanary.exe" => "discordcanary",
+        _ => "discord",
+    }
+}
+
+fn discord_modules_root(process_name: &str, host_version: &str) -> Result<PathBuf, AnyError> {
+    let appdata = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or("APPDATA is not set")?;
+    Ok(appdata
+        .join(discord_config_dir(process_name))
+        .join(host_version)
+        .join("modules"))
+}
+
+fn manifest_host_version(manifest: &Value) -> Result<String, AnyError> {
+    json_version(
+        manifest
+            .get("full")
+            .and_then(|v| v.get("host_version"))
+            .ok_or("Discord manifest is missing full.host_version")?,
+    )
+}
+
 fn discord_update_client() -> Result<Client, AnyError> {
     let proxy_url = format!("http://127.0.0.1:{UPDATER_HTTP_PORT}");
     Ok(Client::builder()
@@ -807,12 +1232,7 @@ async fn ensure_latest_discord_host(
         .strip_prefix("app-")
         .ok_or("Unexpected Discord app folder name")?;
 
-    let latest_version = json_version(
-        manifest
-            .get("full")
-            .and_then(|v| v.get("host_version"))
-            .ok_or("Discord manifest is missing full.host_version")?,
-    )?;
+    let latest_version = manifest_host_version(manifest)?;
 
     let target_dir = install_root.join(format!("app-{latest_version}"));
     let target_exe = target_dir.join(process_name);
@@ -903,16 +1323,6 @@ async fn sync_discord_modules(
     process_name: &str,
     manifest: &Value,
 ) -> Result<PathBuf, AnyError> {
-    let config_dir = match process_name.to_ascii_lowercase().as_str() {
-        "discordptb.exe" => "discordptb",
-        "discordcanary.exe" => "discordcanary",
-        _ => "discord",
-    };
-
-    let appdata = env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or("APPDATA is not set")?;
-
     let app_folder = exe
         .parent()
         .and_then(Path::file_name)
@@ -926,12 +1336,7 @@ async fn sync_discord_modules(
 
     let client = discord_update_client()?;
 
-    let manifest_host = json_version(
-        manifest
-            .get("full")
-            .and_then(|v| v.get("host_version"))
-            .ok_or("Discord manifest is missing full.host_version")?,
-    )?;
+    let manifest_host = manifest_host_version(manifest)?;
 
     if manifest_host != host_version {
         return Err(format!(
@@ -945,7 +1350,7 @@ async fn sync_discord_modules(
         .and_then(Value::as_array)
         .ok_or("Discord manifest is missing required_modules")?;
 
-    let modules_root = appdata.join(config_dir).join(&host_version).join("modules");
+    let modules_root = discord_modules_root(process_name, &host_version)?;
     fs::create_dir_all(&modules_root)?;
 
     let installed_path = modules_root.join("installed.json");
@@ -1174,16 +1579,12 @@ fn prepare_discord_startup(
     process_name: &str,
     modules_root: &Path,
 ) -> Result<(), AnyError> {
-    let config_dir = match process_name.to_ascii_lowercase().as_str() {
-        "discordptb.exe" => "discordptb",
-        "discordcanary.exe" => "discordcanary",
-        _ => "discord",
-    };
-
     let appdata = env::var_os("APPDATA")
         .map(PathBuf::from)
         .ok_or("APPDATA is not set")?;
-    let settings = appdata.join(config_dir).join("settings.json");
+    let settings = appdata
+        .join(discord_config_dir(process_name))
+        .join("settings.json");
 
     patch_json_flags(
         &settings,
@@ -1269,19 +1670,20 @@ fn stop_existing_discord(process_name: &str) {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_discord(exe: &Path, voice_tcp: bool) -> Result<Child, AnyError> {
+fn launch_discord(
+    exe: &Path,
+    voice_tcp: bool,
+    signals: &Arc<StartupSignals>,
+) -> Result<Child, AnyError> {
     let parent = exe.parent().ok_or("Discord executable has no parent")?;
     let proxy = format!("socks5://127.0.0.1:{FRONTEND_PORT}");
-
-    let log_stdout = last_log::open_append_file()?;
-    let log_stderr = log_stdout.try_clone()?;
 
     let mut cmd = Command::new(exe);
     cmd.current_dir(parent)
         .arg(format!("--proxy-server={proxy}"))
         .arg("--disable-quic")
-        .stdout(Stdio::from(log_stdout))
-        .stderr(Stdio::from(log_stderr));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // Prevent Discord and its child processes from inheriting any ambient
     // proxy environment. Only Chromium's explicit --proxy-server is used.
@@ -1307,7 +1709,36 @@ fn launch_discord(exe: &Path, voice_tcp: bool) -> Result<Child, AnyError> {
         println!("Voice test mode: forcing WebRTC away from non-proxied UDP");
     }
 
-    Ok(cmd.spawn()?)
+    let mut child = cmd.spawn()?;
+    if let Some(stdout) = child.stdout.take() {
+        forward_discord_output(stdout, signals.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_discord_output(stderr, signals.clone());
+    }
+    Ok(child)
+}
+
+/// Copies Discord's output into last-run.log and watches it for startup markers.
+fn forward_discord_output(output: impl Read + Send + 'static, signals: Arc<StartupSignals>) {
+    use std::io::BufRead;
+
+    thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(output);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\r', '\n']);
+            signals.observe(text);
+            last_log::write_file_line(text);
+        }
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -1322,7 +1753,7 @@ mod tray {
     use std::{
         mem::{size_of, zeroed},
         ptr::{null, null_mut},
-        sync::atomic::{AtomicIsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicIsize, Ordering},
         thread,
         time::Duration,
     };
@@ -1332,20 +1763,78 @@ mod tray {
         System::{Console::GetConsoleWindow, LibraryLoader::GetModuleHandleW},
         UI::{
             Shell::{
-                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-                NOTIFYICONDATAW,
+                Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+                NIM_DELETE, NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic,
                 LoadIconW, PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow,
                 TranslateMessage, HICON, ICON_BIG, ICON_SMALL, MSG, SW_HIDE, SW_RESTORE, WM_APP,
-                WM_DESTROY, WM_LBUTTONUP, WM_SETICON, WNDCLASSW,
+                WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETICON, WNDCLASSW,
             },
         },
     };
 
     const WM_TRAY_ICON: u32 = WM_APP + 1;
+    const TRAY_ICON_ID: u32 = 1;
+    const DEFAULT_TIP: &str = "DiscordOnlyDPI - click to restore";
     static CONSOLE_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+    static UPDATE_READY: AtomicBool = AtomicBool::new(false);
+    static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// Shows a notification that a Discord update is ready. Clicking it, or
+    /// right-clicking the tray icon, requests a Discord restart.
+    pub fn announce_update(update: &str) {
+        UPDATE_READY.store(true, Ordering::SeqCst);
+        unsafe {
+            let Some(mut icon) = tray_icon() else {
+                return;
+            };
+            icon.uFlags = NIF_INFO | NIF_TIP;
+            icon.dwInfoFlags = NIIF_INFO;
+            copy_wide(&mut icon.szInfoTitle, "Discord update ready");
+            copy_wide(
+                &mut icon.szInfo,
+                &format!("{update} is ready. Click here to restart Discord now."),
+            );
+            copy_wide(
+                &mut icon.szTip,
+                "DiscordOnlyDPI - update ready, right-click to restart Discord",
+            );
+            Shell_NotifyIconW(NIM_MODIFY, &icon);
+        }
+    }
+
+    /// Returns true once after the user asked to restart Discord for an update.
+    pub fn take_restart_request() -> bool {
+        if !RESTART_REQUESTED.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+
+        UPDATE_READY.store(false, Ordering::SeqCst);
+        unsafe {
+            if let Some(mut icon) = tray_icon() {
+                icon.uFlags = NIF_TIP;
+                copy_wide(&mut icon.szTip, DEFAULT_TIP);
+                Shell_NotifyIconW(NIM_MODIFY, &icon);
+            }
+        }
+        true
+    }
+
+    unsafe fn tray_icon() -> Option<NOTIFYICONDATAW> {
+        let raw = TRAY_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            return None;
+        }
+
+        let mut icon: NOTIFYICONDATAW = zeroed();
+        icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = raw as HWND;
+        icon.uID = TRAY_ICON_ID;
+        Some(icon)
+    }
 
     pub fn start() {
         let console = unsafe { GetConsoleWindow() };
@@ -1396,10 +1885,17 @@ mod tray {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if msg == WM_TRAY_ICON && lparam as u32 == WM_LBUTTONUP {
-            let raw = CONSOLE_HWND.load(Ordering::SeqCst);
-            if raw != 0 {
-                ShowWindow(raw as HWND, SW_RESTORE);
+        if msg == WM_TRAY_ICON {
+            let event = lparam as u32;
+            if event == WM_LBUTTONUP {
+                let raw = CONSOLE_HWND.load(Ordering::SeqCst);
+                if raw != 0 {
+                    ShowWindow(raw as HWND, SW_RESTORE);
+                }
+            } else if (event == NIN_BALLOONUSERCLICK || event == WM_RBUTTONUP)
+                && UPDATE_READY.load(Ordering::SeqCst)
+            {
+                RESTART_REQUESTED.store(true, Ordering::SeqCst);
             }
             return 0;
         }
@@ -1448,18 +1944,16 @@ mod tray {
         let mut icon: NOTIFYICONDATAW = zeroed();
         icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         icon.hWnd = hwnd;
-        icon.uID = 1;
+        icon.uID = TRAY_ICON_ID;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = WM_TRAY_ICON;
         icon.hIcon = load_app_icon();
-
-        let tooltip = wide("DiscordOnlyDPI - click to restore");
-        let copy_len = tooltip.len().saturating_sub(1).min(icon.szTip.len() - 1);
-        icon.szTip[..copy_len].copy_from_slice(&tooltip[..copy_len]);
+        copy_wide(&mut icon.szTip, DEFAULT_TIP);
 
         if Shell_NotifyIconW(NIM_ADD, &icon) == 0 {
             return;
         }
+        TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
 
         let mut message: MSG = zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
@@ -1472,5 +1966,52 @@ mod tray {
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Copies `value` into a fixed-size, null-terminated UTF-16 buffer.
+    fn copy_wide(target: &mut [u16], value: &str) {
+        let capacity = target.len().saturating_sub(1);
+        let mut len = 0;
+        for (slot, unit) in target.iter_mut().take(capacity).zip(value.encode_utf16()) {
+            *slot = unit;
+            len += 1;
+        }
+        target[len] = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_startup_from_discord_output() {
+        let signals = StartupSignals::default();
+        signals.observe("Starting app.");
+        signals.observe("splashScreen.launchMainWindow: false");
+        assert!(!signals.started.load(Ordering::SeqCst));
+
+        signals.observe("22:54:54.181 > [FAST CONNECT] wss://gateway.discord.gg/?encoding=etf&v=9");
+        assert!(signals.started.load(Ordering::SeqCst));
+        assert!(!signals.failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn detects_missing_core_module() {
+        let signals = StartupSignals::default();
+        signals.observe("fatal: Error: Cannot find module 'discord_desktop_core'");
+        assert!(signals.failed.load(Ordering::SeqCst));
+        assert!(!signals.started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ignores_lines_that_only_look_like_timestamps() {
+        assert!(!is_discord_app_log("22:54:54 > short"));
+        assert!(!is_discord_app_log(
+            "blackbox: 11/10/2026, 10:54:53 PM GMT+3 1 Discord starting"
+        ));
+        assert!(is_discord_app_log(
+            "22:55:08.604 > [libdiscore] [BlockedDomainsStore] ok"
+        ));
     }
 }
