@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/DiscordOnlyDPI.png" width="170" alt="DiscordOnlyDPI logo">
+<img src="assets/DiscordOnlyDPI-PROXY.png" width="170" alt="DiscordOnlyDPI logo">
 
 # DiscordOnlyDPI
 
@@ -255,7 +255,8 @@ DiscordOnlyDPI/
 │   └── release.yml
 ├── assets/
 │   ├── DiscordOnlyDPI.ico
-│   └── DiscordOnlyDPI.png
+│   ├── DiscordOnlyDPI.png
+│   └── DiscordOnlyDPI-PROXY.png
 ├── release-notes/
 │   ├── v0.9.3.md
 │   ├── v0.9.4.md
@@ -527,7 +528,8 @@ DiscordOnlyDPI/
 │   └── release.yml
 ├── assets/
 │   ├── DiscordOnlyDPI.ico
-│   └── DiscordOnlyDPI.png
+│   ├── DiscordOnlyDPI.png
+│   └── DiscordOnlyDPI-PROXY.png
 ├── release-notes/
 │   ├── v0.9.3.md
 │   ├── v0.9.4.md
