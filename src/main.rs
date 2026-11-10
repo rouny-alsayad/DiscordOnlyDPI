@@ -30,14 +30,22 @@ mod last_log {
 
     static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
-    pub fn init() -> io::Result<PathBuf> {
-        let base = env::var_os("LOCALAPPDATA")
+    fn log_dir() -> PathBuf {
+        env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir)
-            .join("DiscordOnlyDPI");
+            .join("DiscordOnlyDPI")
+    }
+
+    pub fn path() -> PathBuf {
+        log_dir().join("last-run.log")
+    }
+
+    pub fn init() -> io::Result<PathBuf> {
+        let base = log_dir();
         fs::create_dir_all(&base)?;
 
-        let path = base.join("last-run.log");
+        let path = path();
 
         // DiscordOnlyDPI owns this directory's diagnostic logs. Keep exactly one.
         if let Ok(entries) = fs::read_dir(&base) {
@@ -93,14 +101,15 @@ mod last_log {
     }
 
     pub fn open_append_file() -> io::Result<File> {
-        let base = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir)
-            .join("DiscordOnlyDPI");
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(base.join("last-run.log"))
+        OpenOptions::new().create(true).append(true).open(path())
+    }
+
+    /// Copies this run's log to error-report.txt. Unlike last-run.log, it is not
+    /// cleared on the next start, so the user can still send it later.
+    pub fn save_error_report() -> io::Result<PathBuf> {
+        let report = log_dir().join("error-report.txt");
+        fs::copy(path(), &report)?;
+        Ok(report)
     }
 }
 
@@ -147,6 +156,8 @@ const BYEDPI_ARGS: &[&str] = &[
     "--tlsrec",
     "1+s",
 ];
+// Where users are asked to send error-report.txt.
+const SUPPORT_URL: &str = "https://github.com/rouny-alsayad/DiscordOnlyDPI/issues";
 const RELEASES_API: &str =
     "https://api.github.com/repos/rouny-alsayad/DiscordOnlyDPI/releases/latest";
 // Set for a process started by a self-update; it holds the previous version.
@@ -194,6 +205,11 @@ async fn main() -> Result<(), AnyError> {
             Ok(()) => Ok(()),
             Err(error) => {
                 eprintln!("Fatal error: {error}");
+                report_problem(
+                    &format!("صار خطأ ووقف DiscordOnlyDPI:\n{error}"),
+                    &format!("DiscordOnlyDPI stopped because of an error:\n{error}"),
+                    true,
+                );
                 Err(error)
             }
         }
@@ -273,6 +289,17 @@ async fn run_windows() -> Result<(), AnyError> {
                         "Discord {} failed to start and there is no earlier working version to roll back to",
                         prepared.host
                     );
+                    report_problem(
+                        &format!(
+                            "ديسكورد {} ما اشتغل، وما في إصدار قبله كان شغال لنرجعك عليه.",
+                            prepared.host
+                        ),
+                        &format!(
+                            "Discord {} failed to start, and there is no earlier working version to go back to.",
+                            prepared.host
+                        ),
+                        true,
+                    );
                     break;
                 };
 
@@ -282,6 +309,19 @@ async fn run_windows() -> Result<(), AnyError> {
                 );
                 launch.bad_host = Some(prepared.host.clone());
                 launch.save();
+                report_problem(
+                    &format!(
+                        "صار في مشكلة بتشغيل إصدار ديسكورد الجديد {}.\n\
+                         رح نرجعك للإصدار {fallback} اللي كان شغال، وديسكورد رح يفتح بعد شوي.",
+                        prepared.host
+                    ),
+                    &format!(
+                        "The new Discord version {} failed to start.\n\
+                         Going back to {fallback}, which was working. Discord will open in a moment.",
+                        prepared.host
+                    ),
+                    false,
+                );
             }
         }
     }
@@ -292,6 +332,54 @@ async fn run_windows() -> Result<(), AnyError> {
     println!("DiscordOnlyDPI shutdown complete");
 
     Ok(())
+}
+
+/// Text for the problem dialog: what happened, then how to send the error file.
+fn problem_message(arabic: &str, english: &str, report: &str) -> String {
+    format!(
+        "{arabic}\n\n\
+         ساعدنا نصلّح المشكلة: ابعت ملف الخطأ للمطور.\n\
+         الملف: {report}\n\
+         تواصل مع المطور: {SUPPORT_URL}\n\
+         لما تضغط OK رح ينفتح المجلد والملف محدد.\n\n\
+         ────────────\n\n\
+         {english}\n\n\
+         Please send the error file to the developer.\n\
+         File: {report}\n\
+         Contact: {SUPPORT_URL}"
+    )
+}
+
+/// Saves error-report.txt and tells the user what happened and where the file is.
+/// With `wait` false, DiscordOnlyDPI keeps working while the message is open.
+#[cfg(target_os = "windows")]
+fn report_problem(arabic: &str, english: &str, wait: bool) {
+    let report = match last_log::save_error_report() {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Could not save error-report.txt: {error}");
+            last_log::path()
+        }
+    };
+    println!("Error report: {}", report.display());
+
+    let text = problem_message(arabic, english, &report.display().to_string());
+    let dialog = thread::spawn(move || {
+        tray::show_message("DiscordOnlyDPI", &text);
+        show_in_explorer(&report);
+    });
+    if wait {
+        let _ = dialog.join();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_in_explorer(file: &Path) {
+    use std::os::windows::process::CommandExt;
+    // explorer.exe parses its own command line, so the quoted path is passed as is.
+    let _ = Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", file.display()))
+        .spawn();
 }
 
 /// A newer GitHub release of DiscordOnlyDPI that can be installed.
@@ -2007,8 +2095,9 @@ mod tray {
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic,
-                LoadIconW, PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow,
-                TranslateMessage, HICON, ICON_BIG, ICON_SMALL, MSG, SW_HIDE, SW_RESTORE, WM_APP,
+                LoadIconW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow,
+                TranslateMessage, HICON, ICON_BIG, ICON_SMALL, MB_ICONWARNING, MB_OK, MB_RIGHT,
+                MB_RTLREADING, MB_SETFOREGROUND, MB_TOPMOST, MSG, SW_HIDE, SW_RESTORE, WM_APP,
                 WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETICON, WNDCLASSW,
             },
         },
@@ -2060,6 +2149,20 @@ mod tray {
             }
         }
         true
+    }
+
+    /// Shows a right-to-left (Arabic first) warning box; blocks until OK is pressed.
+    pub fn show_message(title: &str, text: &str) {
+        let title = wide(title);
+        let text = wide(text);
+        unsafe {
+            MessageBoxW(
+                null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND | MB_RTLREADING | MB_RIGHT,
+            );
+        }
     }
 
     /// Removes the tray icon so it does not linger after DiscordOnlyDPI exits.
@@ -2334,6 +2437,19 @@ mod tests {
         );
         assert_eq!(checksum_for(&sums, "other.exe"), None);
         assert_eq!(checksum_for(&sums, "missing.exe"), None);
+    }
+
+    #[test]
+    fn problem_message_says_where_the_error_file_is() {
+        let text = problem_message(
+            "ديسكورد ما اشتغل.",
+            "Discord failed to start.",
+            r"C:\Users\me\AppData\Local\DiscordOnlyDPI\error-report.txt",
+        );
+        assert!(text.starts_with("ديسكورد ما اشتغل."));
+        assert!(text.contains("Discord failed to start."));
+        assert_eq!(text.matches("error-report.txt").count(), 2);
+        assert_eq!(text.matches(SUPPORT_URL).count(), 2);
     }
 
     #[test]
