@@ -51,7 +51,7 @@ The main goal is simple: **affect Discord only**.
 - SHA-256 verification for downloaded Discord update packages.
 - Automatic Minimize to Tray.
 - Custom application / taskbar / tray icon.
-- One diagnostic log file only: `last-run.log`.
+- One current-run log, `last-run.log`, plus an `error-report.txt` snapshot when a reported failure occurs.
 
 ## How it works
 
@@ -152,7 +152,21 @@ DiscordOnlyDPI keeps **one log file only**:
 
 Every launch truncates the previous run and records only the current/latest run.
 
-The log includes DiscordOnlyDPI messages and relevant child-process output, making it the first file to share when troubleshooting a crash, failed update, missing module, or connection problem.
+The log includes DiscordOnlyDPI messages and relevant child-process output. For troubleshooting a crash, failed update, missing module, or connection problem, check this file first.
+
+### Error reporting
+
+When Discord fails to start, an attempted rollback is needed, or DiscordOnlyDPI stops with a fatal error, the application displays an Arabic/English warning explaining the problem. It tries to save a copy of the current log here:
+
+```text
+%LOCALAPPDATA%\DiscordOnlyDPI\error-report.txt
+```
+
+Unlike `last-run.log`, this report is **not erased on the next launch**. Select **OK** in the warning to open File Explorer with the report selected, then attach it to an issue at [GitHub Issues](https://github.com/rouny-alsayad/DiscordOnlyDPI/issues). If saving the copy fails, the dialog instead points to `last-run.log`.
+
+If a previous working Discord version exists, DiscordOnlyDPI attempts to restore it. If no known working version exists, it cannot roll back. An error dialog does not by itself mean the rollback succeeded.
+
+**Privacy:** diagnostic files may contain network addresses, local paths, or other runtime details. Review the report before posting it publicly; do not share passwords or private tokens.
 
 ## Usage
 
@@ -181,6 +195,7 @@ DiscordOnlyDPI uses:
 ```text
 %LOCALAPPDATA%\DiscordOnlyDPI\bin\ciadpi.exe
 %LOCALAPPDATA%\DiscordOnlyDPI\last-run.log
+%LOCALAPPDATA%\DiscordOnlyDPI\error-report.txt
 %LOCALAPPDATA%\DiscordOnlyDPI\state.json
 ```
 
@@ -236,15 +251,22 @@ Bump `version` in `Cargo.toml` and write `release-notes/v<version>.md` first, th
 
 ```text
 DiscordOnlyDPI/
+├── .github/
+│   └── release.yml
 ├── assets/
-│   └── DiscordOnlyDPI.ico
+│   ├── DiscordOnlyDPI.ico
+│   └── DiscordOnlyDPI.png
+├── release-notes/
+│   ├── v0.9.3.md
+│   ├── v0.9.4.md
+│   └── v0.9.5.md
 ├── src/
 │   └── main.rs
+├── tools/
+│   └── rc.exe
 ├── build.rs
 ├── build-windows.sh
 ├── publish-release.sh
-├── tools/
-│   └── rc.exe
 ├── Cargo.toml
 ├── Cargo.lock
 ├── README.md
@@ -299,7 +321,7 @@ DiscordOnlyDPI هو برنامج Windows مكتوب بلغة Rust هدفه تش�
 - فحص SHA-256 لحزم تحديث Discord قبل تثبيتها.
 - Minimize to Tray.
 - لوقو مخصص للـEXE والـTaskbar والـTray.
-- ملف Log واحد فقط للتشخيص: `last-run.log`.
+- ملف Log للتشغيل الحالي `last-run.log`، مع نسخة `error-report.txt` عند حدوث خطأ يتم الإبلاغ عنه.
 
 ## كيف يعمل البرنامج؟
 
@@ -400,7 +422,21 @@ assets/DiscordOnlyDPI.ico
 
 عند كل تشغيل يتم مسح محتوى التشغيل السابق، ثم تسجيل تشغيل المرة الحالية فقط.
 
-هذا الملف يسجل رسائل DiscordOnlyDPI ومخرجات مهمة من العمليات التابعة، لذلك هو أول ملف يجب مشاركته إذا حدث Crash أو فشل تحديث أو Module ناقص أو مشكلة اتصال.
+هذا الملف يسجل رسائل DiscordOnlyDPI ومخرجات مهمة من العمليات التابعة. افحصه عند حدوث Crash أو فشل تحديث أو Module ناقص أو مشكلة اتصال.
+
+### الإبلاغ عن الأخطاء
+
+إذا فشل Discord في التشغيل، أو احتاج البرنامج لمحاولة الرجوع لإصدار سابق، أو توقف DiscordOnlyDPI بسبب خطأ، تظهر رسالة بالعربية والإنجليزية توضّح المشكلة. ويحاول البرنامج حفظ نسخة من سجل التشغيل هنا:
+
+```text
+%LOCALAPPDATA%\DiscordOnlyDPI\error-report.txt
+```
+
+بعكس `last-run.log`، **لا يتم مسح هذا التقرير عند التشغيل التالي**. اضغط **OK** لفتح مستكشف الملفات مع تحديد التقرير، ثم أرفقه عند فتح بلاغ عبر [GitHub Issues](https://github.com/rouny-alsayad/DiscordOnlyDPI/issues). إذا فشل حفظ التقرير، ستوجّهك الرسالة إلى `last-run.log` بدلًا منه.
+
+إذا كانت هناك نسخة Discord سابقة معروفة بأنها تعمل، يحاول البرنامج استعادتها. أما إذا لم توجد نسخة سليمة محفوظة فلا يمكن الرجوع تلقائيًا. ظهور رسالة خطأ لا يعني بحد ذاته نجاح الرجوع.
+
+**الخصوصية:** قد يحتوي التقرير على عناوين شبكة أو مسارات محلية أو تفاصيل تشغيل. راجعه قبل نشره علنًا، ولا ترسل كلمات مرور أو رموز دخول خاصة.
 
 ## الاستخدام
 
@@ -429,6 +465,7 @@ DiscordOnlyDPI يستخدم:
 ```text
 %LOCALAPPDATA%\DiscordOnlyDPI\bin\ciadpi.exe
 %LOCALAPPDATA%\DiscordOnlyDPI\last-run.log
+%LOCALAPPDATA%\DiscordOnlyDPI\error-report.txt
 %LOCALAPPDATA%\DiscordOnlyDPI\state.json
 ```
 
@@ -486,15 +523,22 @@ bash publish-release.sh
 
 ```text
 DiscordOnlyDPI/
+├── .github/
+│   └── release.yml
 ├── assets/
-│   └── DiscordOnlyDPI.ico
+│   ├── DiscordOnlyDPI.ico
+│   └── DiscordOnlyDPI.png
+├── release-notes/
+│   ├── v0.9.3.md
+│   ├── v0.9.4.md
+│   └── v0.9.5.md
 ├── src/
 │   └── main.rs
+├── tools/
+│   └── rc.exe
 ├── build.rs
 ├── build-windows.sh
 ├── publish-release.sh
-├── tools/
-│   └── rc.exe
 ├── Cargo.toml
 ├── Cargo.lock
 ├── README.md
